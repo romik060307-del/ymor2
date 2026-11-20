@@ -1,1 +1,213 @@
+name: Build Ymor APK
+
+# Build jalan OTOMATIS begitu file di-commit/di-upload ke branch utama.
+# Tombol "Run workflow" (manual) tetap tersedia sebagai cadangan.
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ymor-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          submodules: false
+
+      # Proyek ini besar; runner gratis hanya punya ~14 GB disk kosong.
+      # Hapus alat bawaan yang tidak dipakai SEBELUM memasang JDK/SDK.
+      - name: Free up disk space
+        shell: bash
+        run: |
+          df -h / | tail -n 1
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/local/share/powershell /opt/hostedtoolcache/CodeQL \
+            /usr/local/lib/android/sdk/ndk 2>/dev/null || true
+          df -h / | tail -n 1
+
+      # Mode 1: file proyek langsung ada di root repository.
+      # Mode 2: proyek dibungkus satu file .zip (cara upload lewat browser,
+      #         karena GitHub web hanya menerima ±100 file sekali upload).
+      - name: Locate project (extract ZIP if needed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f gradlew && -f settings.gradle.kts ]]; then
+            echo "Proyek ditemukan langsung di root repository."
+            PROJECT_DIR="$GITHUB_WORKSPACE"
+          else
+            FOUND=""
+            while IFS= read -r -d '' zip; do
+              listing="$(unzip -Z1 "$zip" 2>/dev/null || true)"
+              if grep -Eq '(^|/)gradlew$' <<<"$listing"; then
+                FOUND="$zip"
+                break
+              fi
+            done < <(find . -maxdepth 2 -type f -iname '*.zip' -not -path './.git/*' -print0)
+
+            if [[ -z "$FOUND" ]]; then
+              echo "::error title=Proyek tidak ditemukan::Tidak ada folder proyek (gradlew) maupun file .zip berisi proyek di repository ini. Pastikan file zip proyek ikut ter-upload."
+              ls -la
+              exit 1
+            fi
+
+            echo "Membongkar: $FOUND"
+            mkdir -p "$RUNNER_TEMP/ymor-src"
+            unzip -q -o "$FOUND" -d "$RUNNER_TEMP/ymor-src"
+            GRADLEW="$(find "$RUNNER_TEMP/ymor-src" -maxdepth 3 -type f -name gradlew -print -quit)"
+            PROJECT_DIR="$(dirname "$GRADLEW")"
+          fi
+
+          test -f "$PROJECT_DIR/settings.gradle.kts" || { echo "::error::settings.gradle.kts tidak ada di $PROJECT_DIR"; exit 1; }
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Folder proyek: $PROJECT_DIR"
+          ls "$PROJECT_DIR"
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      # Catatan: proyek ini memakai compileSdk 37.1, paket SDK-nya bernama
+      # "platforms;android-37.1". Paket "platforms;android-37" TIDAK ADA di
+      # katalog Google, jadi jangan dipakai.
+      # Kalau satu paket gagal, build tetap lanjut: Gradle/AGP akan mencoba
+      # mengunduhnya sendiri.
+      - name: Install Android build packages
+        shell: bash
+        run: |
+          set -uo pipefail
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          for pkg in "platform-tools" "platforms;android-37.1" "build-tools;37.0.0" "ndk;30.0.16248370" "cmake;4.1.2"; do
+            echo "::group::sdkmanager --install $pkg"
+            if ! sdkmanager --install "$pkg"; then
+              echo "::warning title=SDK package::Gagal memasang '$pkg' lewat sdkmanager; Gradle akan mencoba sendiri."
+            fi
+            echo "::endgroup::"
+          done
+          sdkmanager --list_installed || true
+
+      # Folder submodule (metroproto & libopus) kosong di file ZIP, isi dari sumber aslinya.
+      - name: Restore source-only submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          clone() {
+            local url="$1" dest="$2" branch="${3:-}"
+            for attempt in 1 2 3; do
+              rm -rf "$dest"
+              if [[ -n "$branch" ]]; then
+                git clone --depth 1 --branch "$branch" "$url" "$dest" && return 0
+              else
+                git clone --depth 1 "$url" "$dest" && return 0
+              fi
+              echo "Clone gagal (percobaan $attempt), mengulang..."
+              sleep 5
+            done
+            return 1
+          }
+
+          if [[ -z "$(find metroproto -type f -name '*.proto' -print -quit 2>/dev/null)" ]]; then
+            clone https://github.com/MetrolistGroup/metroproto.git metroproto
+          fi
+          if [[ ! -f opusDecoder/src/main/jni/libopus/CMakeLists.txt ]]; then
+            clone https://github.com/xiph/opus.git opusDecoder/src/main/jni/libopus v1.5.2
+          fi
+          rm -rf metroproto/.git opusDecoder/src/main/jni/libopus/.git
+
+          [[ -n "$(find metroproto -type f -name '*.proto' -print -quit)" ]] \
+            || { echo "::error::File .proto untuk metroproto tidak ditemukan"; exit 1; }
+          [[ -f opusDecoder/src/main/jni/libopus/CMakeLists.txt ]] \
+            || { echo "::error::libopus tidak lengkap"; exit 1; }
+          echo "metroproto: $(find metroproto -type f -name '*.proto' | wc -l) file .proto"
+          echo "libopus: OK"
+
+      # Simpan unduhan Gradle supaya build ulang jauh lebih cepat.
+      - name: Restore Gradle cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.zip', '**/libs.versions.toml', '**/gradle-wrapper.properties') }}-${{ github.run_id }}
+          restore-keys: |
+            gradle-${{ runner.os }}-${{ hashFiles('**/*.zip', '**/libs.versions.toml', '**/gradle-wrapper.properties') }}-
+            gradle-${{ runner.os }}-
+
+      - name: Build Ymor APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace --console=plain :androidApp:assembleDebug
+
+      - name: Save Gradle cache
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.zip', '**/libs.versions.toml', '**/gradle-wrapper.properties') }}-${{ github.run_id }}
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          APK="$(find androidApp/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          if [[ -z "$APK" ]]; then
+            echo "::error title=APK tidak ditemukan::Build selesai tetapi file .apk tidak ada."
+            exit 1
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp "$APK" "$GITHUB_WORKSPACE/dist/Ymor.apk"
+          (cd "$GITHUB_WORKSPACE/dist" && sha256sum Ymor.apk | tee SHA256SUMS.txt)
+          {
+            echo "### Ymor APK siap diunduh"
+            echo ""
+            echo "- Ukuran: $(du -h "$GITHUB_WORKSPACE/dist/Ymor.apk" | cut -f1)"
+            echo "- SHA-256: \`$(cut -d' ' -f1 "$GITHUB_WORKSPACE/dist/SHA256SUMS.txt")\`"
+            echo "- Unduh artifact **Ymor-Android-APK** di bagian bawah halaman ini."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Ymor APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: Ymor-Android-APK
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+      # Kalau build gagal, laporan detailnya ikut diunggah supaya mudah dicek.
+      - name: Upload build reports (only on failure)
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: Ymor-build-reports
+          path: |
+            ${{ env.PROJECT_DIR }}/androidApp/build/reports
+            ${{ env.PROJECT_DIR }}/shared/build/reports
+            ${{ env.PROJECT_DIR }}/opusDecoder/build/opus-cmake/**/CMakeFiles/CMakeError.log
+          if-no-files-found: ignore
+          retention-days: 7
 
